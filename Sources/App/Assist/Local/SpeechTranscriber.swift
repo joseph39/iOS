@@ -256,8 +256,20 @@ public final class SpeechTranscriber: ObservableObject, SpeechTranscriberProtoco
 
     private func handleRecognitionResult(_ result: SFSpeechRecognitionResult?, error: Error?) {
         if let result {
-            transcript = result.bestTranscription.formattedString
+            let newTranscript = result.bestTranscription.formattedString
+
+            // Calculate average confidence
+            let segments = result.bestTranscription.segments
+            let avgConfidence = segments.isEmpty ? 0 : segments.reduce(0) { $0 + $1.confidence } / Float(segments.count)
+
+            // If the final transcript is empty, but we are reasonably confident about its quality,
+            // then re-use what we previously received.
+            if !result.isFinal || (newTranscript.isEmpty && avgConfidence < 0.3) {
+                transcript = newTranscript
+            }
+
             onTranscriptUpdate?(transcript, result.isFinal)
+
             if !result.isFinal {
                 scheduleSilenceDetection()
             }

@@ -2,6 +2,7 @@ import AVFoundation
 import Foundation
 import GRDB
 import HAKit
+import NaturalLanguage
 import Shared
 
 final class AssistViewModel: NSObject, ObservableObject {
@@ -33,6 +34,14 @@ final class AssistViewModel: NSObject, ObservableObject {
     private var speechTranscriber: (any SpeechTranscriberProtocol)?
     private var speechSynthesizer: (any SpeechSynthesizerProtocol)?
     private var voiceInitiatedRequest = false
+
+    // TTS Streaming & Pacing
+    private let sentenceTokenizer = NLTokenizer(unit: .sentence)
+    private var ttsBuffer = ""
+    private var firstChunkArrivalTime: Date?
+    private var lastChunkArrivalTime: Date?
+    private var isSpeakingTTS = false
+    private var hasResponseEnded = false
 
     // Key for TTS mute setting (matches @AppStorage key in AssistSettingsView)
     static let ttsMuteKey = "assistMuteTTS"
@@ -248,12 +257,21 @@ final class AssistViewModel: NSObject, ObservableObject {
     @MainActor func stopStreaming() {
         isRecording = false
         canSendAudioData = false
+        isSpeakingTTS = false
+        hasResponseEnded = false
+
+        // Stop traditional audio recording
 
         // Stop traditional audio recording
         audioRecorder.stopRecording()
         assistService.finishSendingAudio()
 
         speechTranscriber?.stopListening()
+
+        // Clear TTS streaming state
+        ttsBuffer = ""
+        firstChunkArrivalTime = nil
+        lastChunkArrivalTime = nil
 
         // Remove pending transcription bubble if recording stopped without submitting
         if chatItems.last?.itemType == .pending {
@@ -265,16 +283,82 @@ final class AssistViewModel: NSObject, ObservableObject {
 
     // MARK: - On-Device TTS Methods
 
-    private func speakWithOnDeviceTTS(_ text: String) {
-        if speechSynthesizer == nil {
-            let voiceIdentifier = configuration.onDeviceTTSVoiceIdentifier
-            speechSynthesizer = voiceIdentifier.map { SpeechSynthesizer(voiceIdentifier: $0) } ?? SpeechSynthesizer()
+    private func updateTTSBuffer(with content: String) {
+        let now = Date()
+        if firstChunkArrivalTime == nil {
+            firstChunkArrivalTime = now
+        }
+        lastChunkArrivalTime = now
+        ttsBuffer += content
+
+        processTTSBuffer()
+    }
+
+    private func processTTSBuffer() {
+        guard let firstArrival = firstChunkArrivalTime,
+              let lastArrival = lastChunkArrivalTime else { return }
+
+        if ttsBuffer.isEmpty {
+            return
         }
 
-        speechSynthesizer?.onFinished = { [weak self] in
-            Task { @MainActor in self?.startRecordingAgainIfNeeded() }
+        sentenceTokenizer.string = ttsBuffer
+        let tokens = sentenceTokenizer.tokens(for: ttsBuffer.startIndex ..< ttsBuffer.endIndex)
+        let totalSentenceCount = tokens.count
+
+        if !isSpeakingTTS {
+            // Pacing Logic: Used to determine WHEN to start speaking.
+            let timeElapsed = lastArrival.timeIntervalSince(firstArrival)
+            let charCount = ttsBuffer.count
+            let estimatedPlaybackTime = Double(charCount) / 15.0
+            let arrivalTimeOffset = timeElapsed / 2.0
+            let significantSentenceCount = tokens
+                .filter { ttsBuffer[$0].trimmingCharacters(in: .whitespaces).count >= 15 }.count
+
+            if estimatedPlaybackTime > arrivalTimeOffset, totalSentenceCount >= 2, significantSentenceCount >= 1 {
+                for _ in 1 ..< totalSentenceCount {
+                    releaseNextSentenceFromBuffer()
+                }
+            }
+        } else if totalSentenceCount >= 2 {
+            // Once speaking, release the complete sentences as soon as the last sentence fragments start to arrive.
+            for _ in 1 ..< totalSentenceCount {
+                releaseNextSentenceFromBuffer()
+            }
         }
-        speechSynthesizer?.speak(text)
+    }
+
+    private func releaseNextSentenceFromBuffer() {
+        guard !ttsBuffer.isEmpty else { return }
+
+        sentenceTokenizer.string = ttsBuffer
+
+        if let range = sentenceTokenizer.tokens(for: ttsBuffer.startIndex ..< ttsBuffer.endIndex).first {
+            let sentence = String(ttsBuffer[range])
+            ttsBuffer.removeSubrange(range)
+
+            if speechSynthesizer == nil {
+                let voiceIdentifier = configuration.onDeviceTTSVoiceIdentifier
+                speechSynthesizer = voiceIdentifier
+                    .map { SpeechSynthesizer(voiceIdentifier: $0) } ?? SpeechSynthesizer()
+                speechSynthesizer?.onFinished = { [weak self] in
+                    Task { @MainActor in
+                        if self?.hasResponseEnded == true {
+                            self?.isSpeakingTTS = false
+                            self?.startRecordingAgainIfNeeded()
+                        }
+                    }
+                }
+            }
+            speechSynthesizer?.speakNext(sentence)
+            isSpeakingTTS = true
+        }
+    }
+
+    private func flushTTSBuffer() {
+        while !ttsBuffer.isEmpty {
+            releaseNextSentenceFromBuffer()
+        }
     }
 
     @MainActor private func checkForAutoRecordingAndStart() {
@@ -403,6 +487,11 @@ extension AssistViewModel: AssistServiceDelegate {
         } else {
             appendToChat(.init(content: content, itemType: .output))
         }
+
+        // Handle On-Device TTS Streaming
+        if configuration.enableOnDeviceTTS, !configuration.muteTTS, voiceInitiatedRequest {
+            updateTTSBuffer(with: content)
+        }
     }
 
     func didReceiveEvent(_ event: AssistEvent) {
@@ -417,8 +506,11 @@ extension AssistViewModel: AssistServiceDelegate {
 
     func didReceiveIntentEndContent(_ content: String) {
         appendToChat(.init(content: content, itemType: .output))
+
+        // Handle On-Device TTS Streaming
         if configuration.enableOnDeviceTTS, !configuration.muteTTS, voiceInitiatedRequest {
-            speakWithOnDeviceTTS(content)
+            hasResponseEnded = true
+            flushTTSBuffer()
         }
     }
 

@@ -7,6 +7,7 @@ import Shared
 protocol SpeechSynthesizerProtocol: AnyObject {
     var onFinished: (() -> Void)? { get set }
     func speak(_ text: String)
+    func speakNext(_ text: String)
     func stop()
 }
 
@@ -35,6 +36,14 @@ final class SpeechSynthesizer: NSObject, SpeechSynthesizerProtocol, AVSpeechSynt
 
     func speak(_ text: String) {
         synthesizer.stopSpeaking(at: .immediate)
+        speakUtterance(text)
+    }
+
+    func speakNext(_ text: String) {
+        speakUtterance(text)
+    }
+
+    private func speakUtterance(_ text: String) {
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = voice
         do {
